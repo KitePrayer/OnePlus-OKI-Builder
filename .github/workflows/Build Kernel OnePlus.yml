@@ -890,7 +890,9 @@ jobs:
           cd kernel_workspace/kernel_platform/common
           python3 "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/apply_security_patches.py" "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/patches/security"
 
-      - name: Add SukiSU Ultra
+      - name: Add SukiSU Nova
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd kernel_workspace/kernel_platform
           KSU_META="${{ github.event.inputs.KSU_META }}"
@@ -908,7 +910,26 @@ jobs:
           [[ -n "$KSU_CUSTOM_TAG" ]] && echo "自定义版本标识: $KSU_CUSTOM_TAG" || echo "自定义版本标识: 未启用"
           [[ -n "$MANUAL_HASH" ]] && echo "手动指定 hash: $MANUAL_HASH" || echo "手动指定 hash: 未启用"
 
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${KSU_MANAGER_BRANCH}/kernel/setup.sh" | bash -s "$KSU_BUILTIN_BRANCH"
+          # Nova 只有 builtin 分支带 SUSFS 接线（实测 kernel/Kconfig 里
+          # config KSU_SUSFS 出现次数：builtin=11，main=0，dev=0，builtin-new=0）。
+          # 勾了 SUSFS 却用别的分支，编到一半才会炸且报错难懂，这里提前拦。
+          # KSU_META 的默认值 main/builtin/... 本来就是对的组合。
+          SUSFS_CAPABLE="builtin"
+          if [ "${{ github.event.inputs.SUSFS }}" != "false" ]; then
+            if [[ "$KSU_BUILTIN_BRANCH" != "$SUSFS_CAPABLE" ]]; then
+              echo "❌ 内核分支 '$KSU_BUILTIN_BRANCH' 不带 SUSFS，无法配合「SUSFS」勾选。"
+              echo "   SukiSU Nova 里只有 '$SUSFS_CAPABLE' 分支有 SUSFS 接线"
+              echo "   （main / dev / builtin-new 都没有 KSU_SUSFS 这个符号）。"
+              echo "   二选一：把 KSU_META 第二个字段改成 $SUSFS_CAPABLE，或取消勾选 SUSFS。"
+              exit 11
+            fi
+          else
+            echo "ℹ️ 未勾选 SUSFS，内核分支 '$KSU_BUILTIN_BRANCH' 正常继续。"
+          fi
+
+          # 上游仓库已从 SukiSU-Ultra 改名为 SukiSU-Nova（旧地址 301 跳转，raw 仍可用）。
+          # 这里直接用新地址，避免依赖跳转。
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/${KSU_MANAGER_BRANCH}/kernel/setup.sh" | bash -s "$KSU_BUILTIN_BRANCH"
           cd ./KernelSU
           # SukiSU 的 pkg_observer.c 无条件调用 SUSFS 函数，不编 SUSFS 时会编译失败
           if [ "${{ github.event.inputs.SUSFS }}" = "false" ]; then
@@ -925,10 +946,17 @@ jobs:
             SHORT_HASH=${MANUAL_HASH:0:8}
           fi
 
-          KSU_VERSION_TAG=$(curl -fsSL https://api.github.com/repos/SukiSU-Ultra/SukiSU-Ultra/releases/latest \
-            | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/')
-          if [[ -z "$KSU_VERSION_TAG" || "$(printf '%s\n' "$KSU_VERSION_TAG" "3.1.7" | sort -V | head -n1)" != "3.1.7" ]]; then
-            KSU_VERSION_TAG="3.1.7"
+          # 版本号：优先用检出目录里的 git tag（--depth=1 可能没有），
+          # 退到本地 setup.sh 创建的 .git，最后查 Nova 的 releases/latest。
+          # 不再写死下限：Ultra 的旧下限 3.1.7 对 Nova（当前 v3.0.0）是错的值。
+          KSU_VERSION_TAG=$(git describe --tags --abbrev=0 2>/dev/null | sed -E 's/^v//' || true)
+          if [[ -z "$KSU_VERSION_TAG" ]]; then
+            KSU_VERSION_TAG=$(curl -fsSL https://api.github.com/repos/SukiSU-Nova/SukiSU-Nova/releases/latest \
+              | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/' || true)
+          fi
+          if [[ -z "$KSU_VERSION_TAG" ]]; then
+            echo "⚠️ 取不到 Nova 版本号，用 3.0.0 兜底"
+            KSU_VERSION_TAG="3.0.0"
           fi
           echo "KSU_VERSION_TAG=$KSU_VERSION_TAG" >> $GITHUB_ENV
 
@@ -969,7 +997,29 @@ jobs:
             sed -i "s|^KSU_VERSION_API := .*|KSU_VERSION_API := $ESC_KSU_VERSION_TAG|" kernel/Makefile
           fi
 
-          KSU_VERSION=$(expr $(git rev-list --count "$KSU_MANAGER_BRANCH" 2>/dev/null || echo 13000) + 37185)
+          # Nova 的版本号公式（kernel/Makefile: VERSION_BASE + commits - VERSION_OFFSET）
+          # Ultra 时代的 +37185 是另一套编号，套到 Nova 上会得到错的值。
+          #
+          # 提交数必须走 API：setup.sh 的 clone 可能是 --depth 退化的仓库，
+          # 实测 --depth=1 时 `git rev-list --count HEAD` 返回 1，
+          # 会算出 30000+1-4001=26000 这种错值。
+          # 取法和 Nova 自己的 Makefile 一致：Link header 最后一页页码 = 总数。
+          KSU_VER_BASE=30000
+          KSU_VER_OFFSET=4001
+          KSU_COMMIT_COUNT=$(curl -fsSLI \
+              -H "Authorization: Bearer ${GITHUB_TOKEN:-}" \
+              "https://api.github.com/repos/SukiSU-Nova/SukiSU-Nova/commits?sha=${KSU_BUILTIN_BRANCH}&per_page=1" \
+              2>/dev/null | tr -d '\r' \
+              | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p' | head -n1)
+          if [[ -z "$KSU_COMMIT_COUNT" ]]; then
+            KSU_COMMIT_COUNT=$(git rev-list --count "origin/${KSU_BUILTIN_BRANCH}" 2>/dev/null || echo 0)
+          fi
+          if [[ "${KSU_COMMIT_COUNT:-0}" -gt 100 ]]; then
+            KSU_VERSION=$(expr "$KSU_VER_BASE" + "$KSU_COMMIT_COUNT" - "$KSU_VER_OFFSET")
+          else
+            echo "⚠️ 取不到可信提交数（得到 '${KSU_COMMIT_COUNT:-空}'），KSUVER 用 13000 兜底"
+            KSU_VERSION=13000
+          fi
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
 
           echo "::group::最终 Makefile 中版本信息及部分调试结果预览"
@@ -981,7 +1031,7 @@ jobs:
         run: |
           kotlin "$GITHUB_WORKSPACE/kernel_workspace/Action-Build/scripts/PatchFakePatches.kts" apply "$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/common"
 
-      - name: Apply Patches SukiSU Ultra
+      - name: Apply SUSFS Patches
         env:
           FILE: ${{ env.FILE }}
         run: |
@@ -1509,31 +1559,28 @@ jobs:
           mv -f oImage Image
           cp Image "${GITHUB_WORKSPACE}/AnyKernel3/Image"
 
-      - name: Download Latest SukiSU-Ultra APK from CI
+      - name: Download Latest SukiSU Nova APK
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          MANAGER_ARTIFACT=Manager
+          # Nova 的 APK 发布在 Release assets 里，不是 Actions artifact：
+          #   SukiSU_Nova_v3.0.0_35000-arm64-v8a-release.apk
+          # 旧代码找的是 Ultra 的 build-manager.yml（Nova 里已不存在），
+          # 所以一直静默 exit 0，产物 zip 里从来没有管理器。
+          NOVA_REPO="SukiSU-Nova/SukiSU-Nova"
 
-          echo "Using branch: $KSU_MANAGER_BRANCH"
-          echo "Downloading artifact: $MANAGER_ARTIFACT"
+          apk_url=$(gh api "repos/$NOVA_REPO/releases/latest" \
+            --jq '[.assets[] | select(.name | endswith("-arm64-v8a-release.apk"))][0].browser_download_url // empty' || echo "")
 
-          run_id=$(gh api "repos/SukiSU-Ultra/SukiSU-Ultra/actions/workflows/build-manager.yml/runs?branch=$KSU_MANAGER_BRANCH&status=success&event=push&per_page=1" --jq '.workflow_runs[0].id' || echo "")
-
-          if [[ -z "$run_id" ]]; then
-            echo "No successful workflow run found on branch $KSU_MANAGER_BRANCH. Skipping download."
+          if [[ -z "$apk_url" ]]; then
+            echo "⚠️ 最新 release 里没有 arm64-v8a 的 APK，跳过（不影响内核本身）"
             exit 0
           fi
-          artifact_url=$(gh api "repos/SukiSU-Ultra/SukiSU-Ultra/actions/runs/$run_id/artifacts" | jq -r ".artifacts[] | select(.name == \"$MANAGER_ARTIFACT\") | .archive_download_url" | head -n1)
-
-          if [[ -z "$artifact_url" ]]; then
-            echo "No artifact '$MANAGER_ARTIFACT' found in run $run_id. Skipping download."
-            exit 0
-          fi
-          echo "Downloading from: $artifact_url"
-          curl -fL -H "Authorization: token $GITHUB_TOKEN" -o "${MANAGER_ARTIFACT}.zip" "$artifact_url"
-          unzip -j "${MANAGER_ARTIFACT}.zip" "*.apk" -d ./AnyKernel3/
+          echo "Downloading manager APK from: $apk_url"
+          curl -fL -H "Authorization: token $GITHUB_TOKEN" -o manager.apk "$apk_url"
+          cp -f manager.apk ./AnyKernel3/
+          ls -l ./AnyKernel3/*.apk
 
       - name: Set zip Suffix
         id: suffix
