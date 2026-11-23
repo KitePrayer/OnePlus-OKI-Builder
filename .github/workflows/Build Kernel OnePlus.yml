@@ -594,9 +594,19 @@ jobs:
       - name: Check Disk Space
         run: df -h
 
-      - name: Create and Enable 3G Swap
+      - name: Ensure Swap
         run: |
-          sudo swapoff -a
+          # maximize-build-space.sh 已经在 LVM 上建好 4G swap 了。
+          # 旧写法先 `swapoff -a` 把它关掉，再往根分区 fallocate 3G —— 而根分区
+          # 此时只剩 ROOT_RESERVE_MB(8G) 减去噪音，实测只剩 2.0G，必然 ENOSPC。
+          # 有 swap 就直接用，没有才建。
+          if [ "$(swapon --noheadings --show 2>/dev/null | wc -l)" -gt 0 ]; then
+            echo "已有 swap，跳过创建"
+            swapon --show || true
+            free -h
+            exit 0
+          fi
+          echo "没有 swap，创建 3G /swapfile"
           sudo fallocate -l 3G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
