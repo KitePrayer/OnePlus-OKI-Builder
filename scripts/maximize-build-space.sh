@@ -68,19 +68,51 @@ sudo fallocate -z -l "${ROOT_LVM_SIZE_BYTES}" "${PV_LOOP_PATH}"
 ROOT_LOOP_DEV=$(sudo losetup --find --show "${PV_LOOP_PATH}")
 sudo pvcreate -f "${ROOT_LOOP_DEV}"
 
-echo "在临时盘 /mnt 创建 LVM PV..."
-TEMP_RESERVE_KB=$((TEMP_RESERVE_MB * 1024))
-TEMP_FREE_KB=$(df --block-size=1024 --output=avail /mnt | tail -1)
-TEMP_LVM_SIZE_BYTES=$(( (TEMP_FREE_KB - TEMP_RESERVE_KB) * 1024 ))
-sudo touch "${TMP_PV_LOOP_PATH}"
-sudo fallocate -z -l "${TEMP_LVM_SIZE_BYTES}" "${TMP_PV_LOOP_PATH}"
-TMP_LOOP_DEV=$(sudo losetup --find --show "${TMP_PV_LOOP_PATH}")
-sudo pvcreate -f "${TMP_LOOP_DEV}"
+# /mnt 只有在它是独立挂载点时才值得单独开一块 PV。
+# 新的 runner 镜像（ubuntu-26.04 / 20261116.88.1）上 /mnt 就在根分区里，
+# 这时再从 /mnt 开一块 PV，等于把根分区抽两次：
+#   根 91G 可用 -> /pv.img 83G（留 8G）-> /mnt/tmp-pv.img 6G（只剩 2G）
+# 结果根分区只剩 TEMP_RESERVE，后续往根分区写 swap 必然 ENOSPC，
+# 连 runner 自己写 _diag 日志都会失败。所以这里先判设备号。
+MNT_DEV="$(stat -c '%d' /mnt 2>/dev/null || echo '')"
+ROOT_DEV="$(stat -c '%d' / 2>/dev/null || echo '')"
+TMP_LOOP_DEV=""
+
+if [[ -n "${MNT_DEV}" && "${MNT_DEV}" != "${ROOT_DEV}" ]]; then
+  echo "在临时盘 /mnt 创建 LVM PV..."
+  TEMP_RESERVE_KB=$((TEMP_RESERVE_MB * 1024))
+  TEMP_FREE_KB=$(df --block-size=1024 --output=avail /mnt | tail -1)
+  TEMP_LVM_SIZE_BYTES=$(( (TEMP_FREE_KB - TEMP_RESERVE_KB) * 1024 ))
+  if [[ "${TEMP_LVM_SIZE_BYTES}" -gt 0 ]]; then
+    sudo touch "${TMP_PV_LOOP_PATH}"
+    sudo fallocate -z -l "${TEMP_LVM_SIZE_BYTES}" "${TMP_PV_LOOP_PATH}"
+    TMP_LOOP_DEV=$(sudo losetup --find --show "${TMP_PV_LOOP_PATH}")
+    sudo pvcreate -f "${TMP_LOOP_DEV}"
+  else
+    echo "  /mnt 可用空间不足，跳过"
+  fi
+else
+  echo "/mnt 与 / 是同一个设备（dev ${ROOT_DEV}），跳过第二块 PV"
+  echo "  （新 runner 镜像上 /mnt 不再是独立临时盘，重复开 PV 会把根分区抽干）"
+fi
 
 echo "合并为卷组 ${VG_NAME}..."
-sudo vgcreate "${VG_NAME}" "${TMP_LOOP_DEV}" "${ROOT_LOOP_DEV}"
+if [[ -n "${TMP_LOOP_DEV}" ]]; then
+  sudo vgcreate "${VG_NAME}" "${TMP_LOOP_DEV}" "${ROOT_LOOP_DEV}"
+else
+  sudo vgcreate "${VG_NAME}" "${ROOT_LOOP_DEV}"
+fi
 
 echo "重建 swap..."
+# 卷组大小可能因为跳过 /mnt 那块 PV 而变小，swap 请求量要按实际可用收敛，
+# 否则 lvcreate 会因空间不足失败（并把 set -e 的脚本整个带崩）。
+SWAP_SIZE_MB="${SWAP_SIZE_MB:-4096}"
+VG_FREE_MB=$(sudo vgs --noheadings --units m --nosuffix -o vg_free "${VG_NAME}" 2>/dev/null \
+             | tr -d ' ' | cut -d'.' -f1)
+if [[ -n "${VG_FREE_MB}" && "${VG_FREE_MB}" -lt "${SWAP_SIZE_MB}" ]]; then
+  echo "  卷组可用 ${VG_FREE_MB}MiB 小于请求的 ${SWAP_SIZE_MB}MiB，收敛到 ${VG_FREE_MB}MiB"
+  SWAP_SIZE_MB="${VG_FREE_MB}"
+fi
 sudo lvcreate -L "${SWAP_SIZE_MB}M" -n swap "${VG_NAME}"
 sudo mkswap "/dev/mapper/${VG_NAME}-swap"
 sudo swapon "/dev/mapper/${VG_NAME}-swap"
